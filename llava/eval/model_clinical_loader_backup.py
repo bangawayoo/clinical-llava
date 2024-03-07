@@ -13,9 +13,8 @@
 #    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
-
+import argparse
 import os
-os.environ["WANDB_PROJECT"]= "llava"
 import copy
 from dataclasses import dataclass, field
 import json
@@ -24,9 +23,9 @@ import pathlib
 from typing import Dict, Optional, Sequence, List
 import sys
 sys.path.append("/workspace/clinical/mediqa-m3g-experiments/LLaVA/")
-import random 
 
 import torch
+
 import transformers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -36,6 +35,9 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
+
 
 from PIL import Image
 
@@ -51,13 +53,13 @@ def rank0_print(*args):
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    lora_name: Optional[str] = field(default=None)
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
-    pretrain_vision_tower: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
@@ -68,7 +70,6 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None,
                            metadata={"help": "Path to the training data."})
-    eval_data_path: str = field(default="clip-annotated-nlp-valid.json")
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
@@ -109,7 +110,6 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
-    tune_vision_tower: bool = field(default=False)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -160,7 +160,7 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
     return to_return
 
 
-def get_custom_state_maybe_zero_3(named_params, keys_to_match):
+def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
     return to_return
@@ -185,28 +185,14 @@ def find_all_linear_names(model):
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
-    if getattr(trainer.args, "tune_vision_tower", False):
-        keys_to_match = ['vision_tower']
-        weight_to_save = get_custom_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
-        trainer.model.config.save_pretrained(output_dir)
 
-        current_folder = output_dir.split('/')[-1]
-        parent_folder = os.path.dirname(output_dir)
-        if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
-            if current_folder.startswith('checkpoint-'):
-                mm_projector_folder = os.path.join(parent_folder, "vision_tower")
-                os.makedirs(mm_projector_folder, exist_ok=True)
-                torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
-            else:
-                torch.save(weight_to_save, os.path.join(output_dir, f'vision_tower.bin'))
-    
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
         keys_to_match = ['mm_projector']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
-        weight_to_save = get_custom_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
 
         current_folder = output_dir.split('/')[-1]
@@ -218,8 +204,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                 torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
-        # save all 
-        # return
+        return
 
     if trainer.deepspeed:
         torch.cuda.synchronize()
@@ -609,13 +594,16 @@ def preprocess(
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+        print("In loop1")
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
+        print("In loop2")
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer)
+    print("custom")
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -631,7 +619,7 @@ def preprocess(
     else:
         conversations_tokenized = _tokenize_fn(conversations, tokenizer)
         input_ids = conversations_tokenized["input_ids"]
-    
+
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
         if has_image:
@@ -643,47 +631,20 @@ def preprocess(
 
     return dict(input_ids=input_ids, labels=targets)
 
-from llava.dataset_utils import DATA_PATH
-def load_multiple_datasets(data_names):
-    data_paths = DATA_PATH
-    list_data_dict = []
-    for name in data_names:
-        data_dict = json.load(open(data_paths[name], "r"))
-        for entry in data_dict:
-            entry['source'] = name 
-        list_data_dict.extend(data_dict)
-    
-    return list_data_dict
-                
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(self, data_path: str,
                  tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments,
-                 eval_mode: bool = False
-                 ):
+                 data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
+        list_data_dict = json.load(open(data_path, "r"))
 
         rank0_print("Formatting inputs...Skip in lazy mode")
-        self.eval_mode = eval_mode
         self.tokenizer = tokenizer
+        self.list_data_dict = list_data_dict
         self.data_args = data_args
-        data_name_list = data_path.split(",")
-        self.list_data_dict = load_multiple_datasets(data_name_list)
-        DEBUG = False
-        if DEBUG:
-            num_total_data = len(self.list_data_dict)
-            self.list_data_dict = self.list_data_dict[:int(num_total_data * 1)]
-
-        if not self.eval_mode:
-            SEED = 0
-            random.seed(SEED)
-            random.shuffle(self.list_data_dict)
-        else:
-            print("Test mode: No shuffling")
-
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -752,6 +713,9 @@ class LazySupervisedDataset(Dataset):
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        
+        data_dict['encounter_id'] = self.list_data_dict[i]['id']
+
         return data_dict
 
 
@@ -785,6 +749,8 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+        
+        batch['encounter_id'] = [x['encounter_id'] for x in instances]
 
         return batch
 
@@ -795,56 +761,13 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
-    eval_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.eval_data_path,
-                                data_args=data_args,
-                                eval_mode=True)    
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
-                eval_dataset=eval_dataset,
+                eval_dataset=None,
                 data_collator=data_collator)
 
-from transformers import TrainerCallback
 
-class CustomCallback(TrainerCallback):
-    def __init__(self, eval_dataset, model, tokenizer, eval_dl):
-        self.eval_dataset = eval_dataset
-        self.eval_dl = eval_dl
-        self.model = model
-        self.tokenizer = tokenizer
-
-    def on_step_end(self, args, state, control, **kwargs):
-        # This method will be called after each training step.
-        # `state.global_step` gives you the current step number
-        certain_steps = 1
-        eval_dataset = self.eval_dataset
-        if state.global_step % certain_steps == 0:
-            # Your custom function logic here
-            device = next(self.model.parameters()).device
-            eval_length = len(eval_dataset)
-            idx = random.sample(range(eval_length), 1)[0]
-            batch = next(iter(self.eval_dl))
-            input_ids = batch['input_ids'].to('cuda', non_blocking=True)
-            image_tensor = batch['images'].to(dtype=torch.bfloat16, device='cuda', non_blocking=True)
-            with torch.inference_mode():
-                output_ids = self.model.generate(
-                    input_ids,
-                    images=image_tensor,
-                    do_sample=False,
-                    temperature=0,
-                    max_new_tokens=30,
-                    use_cache=True)
-
-            input_token_len = input_ids.shape[1]
-            n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
-            if n_diff_input_output > 0:
-                print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
-            outputs = self.tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
-            outputs = outputs.strip()
-            print(outputs)
-
-
-def train():
+def eval_model():
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -912,23 +835,19 @@ def train():
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(
-            r=training_args.lora_r,
-            lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
-            lora_dropout=training_args.lora_dropout,
-            bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
-        )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
-        rank0_print("Adding LoRA adapters...")
-        model = get_peft_model(model, lora_config)
+    # if "adapter_model.bin" in os.listdir(model_args.lora_name):
+    #     # load mm_projector weights from the lora_name 
+    #     # mm_projector_weights = torch.load(os.path.join(model_args.lora_name, "mm_projector.bin"), map_location='cpu')
+    #     # mm_projector_weights = {k.split(".")[-1]:v for k,v in mm_projector_weights.items() if "mm_projector" in k}
+    #     # model.model.mm_projector.load_state_dict(mm_projector_weights, strict=False)
+    #     from peft import PeftModel
+    #     print('Loading LoRA weights...')
+    #     model = PeftModel.from_pretrained(model, model_args.lora_name)
+    #     print('Merging LoRA weights...')
+    #     model = model.merge_and_unload()
+    # else:
+    #     print(f"No lora weights in {model_args.lora_name}")
+    
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -988,10 +907,6 @@ def train():
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
-        
-        if training_args.tune_vision_tower:
-            for p in model.get_vision_tower().parameters():
-                p.requires_grad = True
 
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
@@ -1001,53 +916,47 @@ def train():
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
-    
-    if training_args.bits in [4, 8]:
-        from peft.tuners.lora import LoraLayer
-        for name, module in model.named_modules():
-            if isinstance(module, LoraLayer):
-                if training_args.bf16:
-                    module = module.to(torch.bfloat16)
-            if 'norm' in name:
-                module = module.to(torch.float32)
-            if 'lm_head' in name or 'embed_tokens' in name:
-                if hasattr(module, 'weight'):
-                    if training_args.bf16 and module.weight.dtype == torch.float32:
-                        module = module.to(torch.bfloat16)
 
+    model_base = model_args.model_name_or_path
+    model_path = model_args.lora_name
+    model_name = get_model_name_from_path(model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_base, model_name)
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    # print("Sample:")
-    # print(tokenizer.batch_decode(data_module['train_dataset'][0]['input_ids']))
+    from torch.utils.data import DataLoader
+    eval_dl = DataLoader(data_module['train_dataset'], batch_size=1, collate_fn=data_module['data_collator'])
+    answers = []
+    answers_file = os.path.expanduser("./data/eval/prediction.json")
+    model.eval()
+    for batch_idx, batch in enumerate(eval_dl):
+        device = next(model.parameters()).device
+        input_ids = batch['input_ids'].to(device, non_blocking=True)
+        images = batch['images'].to(device)
 
-    trainer = LLaVATrainer(model=model,
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
-    
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    trainer.save_state()
+        with torch.inference_mode():
+            output_ids = model.generate(input_ids=input_ids, 
+                                        images=images,
+                                        temperature=0,
+                                        max_new_tokens=50,
+                                        use_cache=True)
 
-    model.config.use_cache = True
-
-    if training_args.lora_enable:
-        state_dict = get_peft_state_maybe_zero_3(
-            model.named_parameters(), training_args.lora_bias
-        )
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
-            model.named_parameters()
-        )
-        if training_args.local_rank == 0 or training_args.local_rank == -1:
-            model.config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
-    else:
-        safe_save_model_for_hf_trainer(trainer=trainer,
-                                       output_dir=training_args.output_dir)
+        input_token_len = input_ids.shape[1]
+        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+        if n_diff_input_output > 0:
+            print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
+        outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
+        outputs = outputs.strip()
+        cur_prompt = tokenizer.batch_decode(input_ids)[0]
+        answers.append({"encounter_id": batch['encounter_id'][0],
+                                    "prompt": cur_prompt,
+                                    "responses": [{"content_en": outputs}],
+                                    "answer_id": batch_idx,
+                                    "metadata": {}})
+        
+    ans_file = open(answers_file, "w")
+    json.dump(answers, ans_file)
+    ans_file.close()
 
 
 if __name__ == "__main__":
-    train()
+    eval_model()

@@ -17,39 +17,35 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch.nn import CrossEntropyLoss
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
-                         LlamaConfig, LlamaModel, LlamaForCausalLM
+                         MistralConfig, MistralModel, MistralForCausalLM
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 
-class LlavaConfig(LlamaConfig):
-    model_type = "llava"
+class LlavaMistralConfig(MistralConfig):
+    model_type = "llava_mistral"
 
 
-class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
-    config_class = LlavaConfig
+class LlavaMistralModel(LlavaMetaModel, MistralModel):
+    config_class = LlavaMistralConfig
 
-    def __init__(self, config: LlamaConfig):
-        super(LlavaLlamaModel, self).__init__(config)
+    def __init__(self, config: MistralConfig):
+        super(LlavaMistralModel, self).__init__(config)
 
 
-import deepspeed
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-from collections import OrderedDict
-import torch 
-
-class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
-    config_class = LlavaConfig
+class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
+    config_class = LlavaMistralConfig
 
     def __init__(self, config):
-        super(LlamaForCausalLM, self).__init__(config)
-        self.model = LlavaLlamaModel(config)
-        self.pretraining_tp = config.pretraining_tp
-        self.vocab_size = config.vocab_size
+        super(MistralForCausalLM, self).__init__(config)
+        self.model = LlavaMistralModel(config)
+
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -58,24 +54,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
-    def collect_state_dict(self):
-
-        def _z3_params_to_fetch(param_list):
-            return [p for p in param_list if hasattr(p, "ds_id") and p.ds_status == ZeroParamStatus.NOT_AVAILABLE]
-
-        state_dict = OrderedDict()
-        for k, v in self.model.named_parameters():
-            if hasattr(v, "ds_id"):
-                with deepspeed.zero.GatheredParameters(_z3_params_to_fetch([v]), enabled=True):
-                    v_p = v.data.cpu()
-            else:
-                v_p = v.cpu()
-
-            if torch.distributed.get_rank() == 0:
-                state_dict[k] = v_p
-
-        return state_dict
-    
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -88,6 +66,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
@@ -105,28 +84,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 attention_mask,
                 past_key_values,
                 labels,
-                images
+                images,
+                image_sizes
             )
-                
-        # state_dict = self.collect_state_dict()
-        # for idx, (name, params) in enumerate(state_dict.items()):
-        #     # print(name)
-        #     if 'vision_model' in name:
-        #         print(f"{name} {params.data.mean()}")
-        #         print("***")
-        #         break 
-        # for idx, (name, params) in enumerate(state_dict.items()):
-        #     # print(name)
-        #     if "mm_projector" in name:
-        #         print(f"{name} {params.data.mean()}")
-        #         print("***")
-        #         break
-
-        # vision_tower = self.model.get_vision_tower()
-        # for idx, (name, params) in enumerate(vision_tower.named_parameters()):
-        #     print(name)
-        #     if idx == 10:
-        #         break
 
         return super().forward(
             input_ids=input_ids,
@@ -141,14 +101,58 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return_dict=return_dict
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        position_ids = kwargs.pop("position_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        if "inputs_embeds" in kwargs:
+            raise NotImplementedError("`inputs_embeds` is not supported")
+
+        if images is not None:
+            (
+                inputs,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                _
+            ) = self.prepare_inputs_labels_for_multimodal(
+                inputs,
+                position_ids,
+                attention_mask,
+                None,
+                None,
+                images,
+                image_sizes=image_sizes
+            )
+        else:
+            inputs_embeds = self.get_model().embed_tokens(inputs)
+
+        return super().generate(
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            **kwargs
+        )
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
+                                      inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
-        _inputs = super().prepare_inputs_for_generation(
+        image_sizes = kwargs.pop("image_sizes", None)
+        inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
         if images is not None:
-            _inputs['images'] = images
-        return _inputs
+            inputs['images'] = images
+        if image_sizes is not None:
+            inputs['image_sizes'] = image_sizes
+        return inputs
 
-AutoConfig.register("llava", LlavaConfig)
-AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+AutoConfig.register("llava_mistral", LlavaMistralConfig)
+AutoModelForCausalLM.register(LlavaMistralConfig, LlavaMistralForCausalLM)

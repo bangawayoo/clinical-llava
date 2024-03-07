@@ -25,7 +25,6 @@ from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, D
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
-
     if device != "cuda":
         kwargs['device_map'] = {"": device}
 
@@ -41,13 +40,17 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         )
     else:
         kwargs['torch_dtype'] = torch.float16
-
+    
     if 'llava' in model_name.lower():
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
         if 'lora' in model_name.lower() and model_base is not None:
-            lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            if os.path.exists(os.path.join(model_path, "config.json")):
+                lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            else:
+                print("Loading lora config from base")
+                lora_cfg_pretrained = AutoConfig.from_pretrained(model_base)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             print('Loading LLaVA from base model...')
             model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
@@ -69,6 +72,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         subfolder=subfolder)
                     return torch.load(cache_file, map_location='cpu')
                 non_lora_trainables = load_from_hf(model_path, 'non_lora_trainables.bin')
+            
             non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
             if any(k.startswith('model.model.') for k in non_lora_trainables):
                 non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
@@ -128,7 +132,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     image_processor = None
 
-    if 'llava' in model_name.lower():
+    if 'llava' in model_name.lower() or 'llava' in model_base.lower():
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
         mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
         if mm_use_im_patch_token:
@@ -140,8 +144,19 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:
             vision_tower.load_model()
+        pretrain_vision_tower = os.path.join("./checkpoints/caption", 'vision_tower.bin')
+        if os.path.exists(pretrain_vision_tower):
+            vision_tower_weights = torch.load(pretrain_vision_tower, map_location='cpu')
+            def get_w(weights, keyword):
+                return {k.replace("model.vision_tower.", ""): v for k, v in weights.items() if keyword in k}
+            vision_tower.load_state_dict(get_w(vision_tower_weights, 'vision_tower'), strict=True)
+
         vision_tower.to(device=device, dtype=torch.float16)
         image_processor = vision_tower.image_processor
+
+        mm_projector_weights = torch.load(os.path.join("./checkpoints/caption", 'mm_projector.bin'), map_location='cpu')
+        mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+        model.load_state_dict(mm_projector_weights, strict=False)
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

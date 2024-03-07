@@ -1,0 +1,16 @@
+DATA_PATH = {
+                'atlas': "/workspace/clinical/mediqa-m3g-experiments/data/atlas.json",
+                'train': "/workspace/clinical/mediqa-m3g-experiments/data/mediqa-single_image-train.json",
+                "google-augment": "/workspace/clinical/mediqa-m3g-experiments/data/google-augment-filtered.json",
+                'valid': "/workspace/clinical/mediqa-m3g-experiments/data/mediqa-single_image-valid.json",
+                'valid-aug': "/workspace/clinical/mediqa-m3g-experiments/data/new-valid-245samples.json",
+                'clip': "/workspace/clinical/mediqa-m3g-experiments/data/clip.json",
+                'clip-annotated-train': "/workspace/clinical/mediqa-m3g-experiments/data/clip-annotated-single_image-train.json",
+                'clip-annotated-valid': "/workspace/clinical/mediqa-m3g-experiments/data/clip-annotated-single_image-valid.json",
+                'caption-train': '/workspace/clinical/mediqa-m3g-experiments/data/caption-train.json',
+                'caption-valid': '/workspace/clinical/mediqa-m3g-experiments/data/caption-valid.json',
+                'caption-google-train': '/workspace/clinical/mediqa-m3g-experiments/data/caption-google-train.json',
+                'caption-google-valid': '/workspace/clinical/mediqa-m3g-experiments/data/caption-google-valid.json',
+                'gpt-caption-train': '/workspace/clinical/mediqa-m3g-experiments/data/gpt-caption-train.json',
+                'gpt-caption-valid': '/workspace/clinical/mediqa-m3g-experiments/data/gpt-caption-valid.json',
+                }
